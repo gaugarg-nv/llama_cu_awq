@@ -128,7 +128,7 @@ void freeQWeight(QWeight* pWeight, bool allocOnGpu) {
     custom_free(pWeight->scales, allocOnGpu);
 }
 
-void malloc_weights(TransformerWeights* w, Config* p, bool allocOnGpu) {
+void malloc_weights(TransformerWeights* w, Config* p, int numGPUs, bool allocOnGpu) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     custom_malloc((void**)&w->token_embedding_table, p->vocab_size * p->dim * sizeof(half), allocOnGpu);
     w->layers = (PerLayerWeight*)malloc(p->n_layers * sizeof(PerLayerWeight));
@@ -148,7 +148,7 @@ void malloc_weights(TransformerWeights* w, Config* p, bool allocOnGpu) {
     }
 
     custom_malloc((void**)&w->rms_final_weight, p->dim * sizeof(half), allocOnGpu);
-    custom_malloc((void**)&w->wcls, p->vocab_size * p->dim * sizeof(half), allocOnGpu);
+    custom_malloc((void**)&w->wcls, p->vocab_size * p->dim * sizeof(half) / numGPUs, allocOnGpu);
 
     // ensure all mallocs went fine
     if (!w->token_embedding_table || !w->layers ||
@@ -238,13 +238,13 @@ void uploadQWeight(QWeight& weight, QWeight& srcWeight, size_t height, size_t wi
     readWeight(weight.scales, srcWeight.scales, meta_height * width * sizeof(half));
 }
 
-int checkpoint_init_weights(TransformerWeights* w, Config* p, TransformerWeights* w_src) {
+int checkpoint_init_weights(TransformerWeights* w, Config* p, TransformerWeights* w_src, int rank, int gpu_count) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     
     printf("\nLoading Weights... ");
 
     readWeight(w->token_embedding_table, w_src->token_embedding_table, p->vocab_size * p->dim * sizeof(half));
-    readWeight(w->wcls, w_src->wcls, p->vocab_size * p->dim * sizeof(half));
+    readWeight(w->wcls, w_src->wcls + rank * (p->vocab_size * p->dim / gpu_count), p->vocab_size * p->dim * sizeof(half)/ gpu_count);
     readWeight(w->rms_final_weight, w_src->rms_final_weight, p->dim * sizeof(half));
 
     // upload decoder block weight for each layer
@@ -356,7 +356,7 @@ void MultiHeadAttention(int rank, half *output, half *q, half *key_cache, half *
     vec_mat_kernel <<< grid_dim2, block_dim, 0, streams[rank].stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim / kv_mul, kv_mul);
 }
 
-void run_llama_network(int rank, int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
+void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
     half* x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -407,10 +407,12 @@ void run_llama_network(int rank, int *pPos, Config* p, RunState* s, TransformerW
     // final rmsnorm
     rmsnorm(rank, x, x, w->rms_final_weight, dim);
     // classifier into logits
-    matmul(rank, s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(rank, s->logits + rank * (p->vocab_size / gpu_count), x, w->wcls, p->dim, p->vocab_size / gpu_count);
+
+    ncclAllGather(s->logits + rank * (p->vocab_size / gpu_count), s->logits, p->vocab_size / gpu_count, ncclHalf, comm, streams[rank].stream);
 }
 
-void run_transformer(int rank, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
+void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -430,7 +432,7 @@ void run_transformer(int rank, bool gen_token, Config* p, RunState* s, Transform
     {
         cudaGraph_t graph = {};
         CUDA_CHECK(cudaStreamBeginCapture(streams[rank].stream, cudaStreamCaptureModeThreadLocal));
-        run_llama_network(rank, s->pos, p, s, w, seq_len_bin);
+        run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len_bin);
         CUDA_CHECK(cudaStreamEndCapture(streams[rank].stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&streams[rank].cudaGraphInstance[graphIndex], graph, 0));
         CUDA_CHECK(cudaGraphDestroy(graph));
@@ -438,7 +440,7 @@ void run_transformer(int rank, bool gen_token, Config* p, RunState* s, Transform
     }
     cudaGraphLaunch(streams[rank].cudaGraphInstance[graphIndex], streams[rank].stream);
 #else
-    run_llama_network(rank, s->pos, p, s, w, seq_len);
+    run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len);
 #endif
 
     if (copyLogits) {
@@ -471,12 +473,12 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-void init_transformer(Transformer* t, bool perplexity, int rank)
+void init_transformer(Transformer* t, bool perplexity, int rank, int gpu_count)
 {
     cudaSetDevice(rank);
     // read in the Transformer weights
-    malloc_weights(&(t->pInfo[rank].d_weights), &t->config, true);
-    if (checkpoint_init_weights(&(t->pInfo[rank].d_weights), &t->config, &t->h_weights)) { exit(1); }
+    malloc_weights(&(t->pInfo[rank].d_weights), &t->config, gpu_count, true);
+    if (checkpoint_init_weights(&(t->pInfo[rank].d_weights), &t->config, &t->h_weights, rank, gpu_count)) { exit(1); }
 
     malloc_run_state(&(t->pInfo[rank].state), &t->config, perplexity);
 
@@ -499,12 +501,12 @@ void build_transformer(Transformer* t, int gpu_count, char* checkpoint_path, boo
     ncclGetUniqueId(&t->ncclId);
 
     // read in the Transformer weights
-    malloc_weights(&(t->h_weights), &t->config, false);
+    malloc_weights(&(t->h_weights), &t->config, 1, false);
     if (checkpoint_init_weights(&(t->h_weights), &t->config, file)) { exit(1); }
 
     std::vector<std::thread> threads;
     for (int i = 0; i < gpu_count; i++) {
-        threads.push_back(std::thread(init_transformer, t, perplexity, i));
+        threads.push_back(std::thread(init_transformer, t, perplexity, i, gpu_count));
     }
 
     for (auto& t : threads) {
@@ -564,7 +566,7 @@ void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sa
         // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
         cudaStreamSynchronize(streams[rank].stream);
         // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
-        run_transformer(rank, pos >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
+        run_transformer(rank, gpu_count, comm, pos >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
 
         if (pos > 0) {
             next = transformer->pInfo[rank].state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
@@ -582,12 +584,14 @@ void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sa
         pos++;
     }
 
-    ncclCommDestroy(comm);
+    cudaStreamSynchronize(streams[rank].stream);
 
 #if USE_CUDA_GRAPHS
     for (int i = 0; i < MAX_GRAPHS; i++)
         if (streams[rank].graphCaptured[i]) cudaGraphExecDestroy(streams[rank].cudaGraphInstance[i]);
 #endif
+
+    ncclCommDestroy(comm);
 
     if(rank == 1)
     {
@@ -662,6 +666,8 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     int pos = 0;     // position in the sequence
 
     int rank = 0;
+    int gpu_count = 1;
+    ncclComm_t comm;
 
     // init GPU state
     cudaMemset(transformer->pInfo[rank].state.pos, pos, sizeof(int));
@@ -717,7 +723,7 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
         // wait for GPU work for previous iteration to complete
         // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
         cudaStreamSynchronize(streams[rank].stream);
-        run_transformer(rank, user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
+        run_transformer(rank, gpu_count, comm, user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
 
         user_idx++;
 
