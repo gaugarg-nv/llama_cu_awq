@@ -10,9 +10,8 @@ Based on [llama2.c](https://github.com/karpathy/llama2.c)
 git clone https://github.com/ankan-ban/llama_cu_awq
 cd llama_cu_awq
 mdkir build
-cd build
-cmake ..
-cmake --build . --config Release
+cmake -DCMAKE_BUILD_TYPE=Debug -B build -DNCCL_ROOT_DIR=/home/scratch.gaugarg_sw/hpc_sdk/Linux_x86_64/2025/comm_libs/nccl
+cmake --build build
 cd ..
 ```
 

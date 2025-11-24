@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <cuda_fp16.h>
 
+#include "nccl.h"
+
 constexpr int MAX_SEQ_LEN_SMEM_KERNEL = 8192; // 8k is the max sequence length supported by the kernel that uses shared memory
 constexpr int MAX_SEQ_LEN = 128 * 1024;       // Can be arbitirarily large, but we need to allocate memory for the whole sequence
 
@@ -71,10 +73,19 @@ typedef struct {
     float* logits_array;  // array of output logits used to compute perplexity (seq_len, vocab_size)
 } RunState;
 
+struct PerThreadInfo {
+    ncclComm_t comm;
+    int rank;
+    TransformerWeights d_weights; // the weights of the model on device
+    RunState state; // buffers for the "wave" of activations in the forward pass
+};
+
 typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
-    TransformerWeights weights; // the weights of the model
-    RunState state; // buffers for the "wave" of activations in the forward pass
+    TransformerWeights h_weights; // the weights of the model on host
+    PerThreadInfo* pInfo; // NCCL info for multi-GPU communication
+    ncclUniqueId ncclId; // NCCL unique ID
+    int gpu_count; // number of GPUs being used
 } Transformer;
 
 int divUp(int a, int b) {

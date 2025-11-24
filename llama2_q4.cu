@@ -16,11 +16,12 @@ Inference for Llama-2 Transformer model in pure Cuda.
 4. Run this program pointing to the final weight file.
 */
 
-#define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
 #include <time.h>
 #include <math.h>
 #include <time.h>
+#include <vector>
+#include <thread>
 
 #include "common.h"
 #include "gpu_kernels.h"
@@ -32,6 +33,16 @@ constexpr int group_size = 128; // hardcoded for this implementation
 #define DUMP_PER_TOKEN_TIMINGS 0
 #define USE_CUDA_GRAPHS 1
 
+#define CUDA_CHECK(call) \
+do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in file '%s' in line %i : %s.\n", \
+                __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
 
@@ -41,7 +52,7 @@ void malloc_run_state(RunState* s, Config* p, bool allocLogitsArray) {
     cudaMalloc((void**)&s->xb, p->dim * sizeof(half));
     cudaMalloc((void**)&s->hb, p->hidden_dim * sizeof(half));
     cudaMalloc((void**)&s->q, p->dim * sizeof(half));
-    cudaMalloc((void**)&s->att, p->n_heads * p->dim * sizeof(half));
+    cudaMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(half));
     cudaMalloc((void**)&s->logits, p->vocab_size * sizeof(half));
     cudaMalloc((void**)&s->key_cache, sizeof(half) * p->n_layers * p->seq_len * kv_dim);    // potentially huge allocs
     cudaMalloc((void**)&s->value_cache, sizeof(half) * p->n_layers * p->seq_len * kv_dim);
@@ -87,43 +98,57 @@ size_t getPackedWeightHeight(size_t height)
     return divUp(height, 32) * 4;
 }
 
-void allocQWeight(QWeight* pWeight, size_t height, size_t width) {
+void custom_malloc(void** ptr, size_t size, bool allocOnGpu) {
+    if(allocOnGpu)
+        cudaMalloc(ptr, size);
+    else
+        *ptr = malloc(size);
+}
+
+void allocQWeight(QWeight* pWeight, size_t height, size_t width, bool allocOnGpu) {
     size_t packed_wt_height = getPackedWeightHeight(height);
     size_t scales_height = divUp(height, group_size);
     size_t packed_zeros_height = divUp(scales_height, 8);
 
-    cudaMalloc((void**)&pWeight->weight, packed_wt_height * width * sizeof(uint32_t));
-    cudaMalloc((void**)&pWeight->zeros, packed_zeros_height * width * sizeof(uint32_t));
-    cudaMalloc((void**)&pWeight->scales, scales_height * width * sizeof(half));
+    custom_malloc((void**)&pWeight->weight, packed_wt_height * width * sizeof(uint32_t), allocOnGpu);
+    custom_malloc((void**)&pWeight->zeros, packed_zeros_height * width * sizeof(uint32_t), allocOnGpu);
+    custom_malloc((void**)&pWeight->scales, scales_height * width * sizeof(half), allocOnGpu);
 }
 
-void freeQWeight(QWeight* pWeight) {
-    cudaFree(pWeight->weight);
-    cudaFree(pWeight->zeros);
-    cudaFree(pWeight->scales);
+void custom_free(void* ptr, bool allocOnGpu) {
+    if (allocOnGpu)
+        cudaFree(ptr);
+    else
+        free(ptr);
 }
 
-void malloc_weights(TransformerWeights* w, Config* p) {
+void freeQWeight(QWeight* pWeight, bool allocOnGpu) {
+    custom_free(pWeight->weight, allocOnGpu);
+    custom_free(pWeight->zeros, allocOnGpu);
+    custom_free(pWeight->scales, allocOnGpu);
+}
+
+void malloc_weights(TransformerWeights* w, Config* p, bool allocOnGpu) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    cudaMalloc((void**)&w->token_embedding_table, p->vocab_size * p->dim * sizeof(half));
+    custom_malloc((void**)&w->token_embedding_table, p->vocab_size * p->dim * sizeof(half), allocOnGpu);
     w->layers = (PerLayerWeight*)malloc(p->n_layers * sizeof(PerLayerWeight));
     w->num_layers = p->n_layers;
     for (int l = 0; l < p->n_layers; l++)
     {
         PerLayerWeight* layer = &(w->layers[l]);
-        cudaMalloc((void**)&layer->rms_att_weight,  p->dim * sizeof(half));
-        cudaMalloc((void**)&layer->rms_ffn_weight,  p->dim * sizeof(half));
-        allocQWeight(&layer->wq_q, p->dim, p->dim);
-        allocQWeight(&layer->wq_k, p->dim, kv_dim);
-        allocQWeight(&layer->wq_v, p->dim, kv_dim);
-        allocQWeight(&layer->wq_o, p->dim, p->dim);
-        allocQWeight(&layer->wq_gate, p->dim, p->hidden_dim);
-        allocQWeight(&layer->wq_up, p->dim, p->hidden_dim);
-        allocQWeight(&layer->wq_down, p->hidden_dim, p->dim);
+        custom_malloc((void**)&layer->rms_att_weight,  p->dim * sizeof(half), allocOnGpu);
+        custom_malloc((void**)&layer->rms_ffn_weight,  p->dim * sizeof(half), allocOnGpu);
+        allocQWeight(&layer->wq_q, p->dim, p->dim, allocOnGpu);
+        allocQWeight(&layer->wq_k, p->dim, kv_dim, allocOnGpu);
+        allocQWeight(&layer->wq_v, p->dim, kv_dim, allocOnGpu);
+        allocQWeight(&layer->wq_o, p->dim, p->dim, allocOnGpu);
+        allocQWeight(&layer->wq_gate, p->dim, p->hidden_dim, allocOnGpu);
+        allocQWeight(&layer->wq_up, p->dim, p->hidden_dim, allocOnGpu);
+        allocQWeight(&layer->wq_down, p->hidden_dim, p->dim, allocOnGpu);
     }
 
-    cudaMalloc((void**)&w->rms_final_weight, p->dim * sizeof(half));
-    cudaMalloc((void**)&w->wcls, p->vocab_size * p->dim * sizeof(half));
+    custom_malloc((void**)&w->rms_final_weight, p->dim * sizeof(half), allocOnGpu);
+    custom_malloc((void**)&w->wcls, p->vocab_size * p->dim * sizeof(half), allocOnGpu);
 
     // ensure all mallocs went fine
     if (!w->token_embedding_table || !w->layers ||
@@ -133,95 +158,143 @@ void malloc_weights(TransformerWeights* w, Config* p) {
     }
 }
 
-void free_weights(TransformerWeights* w) {
-    cudaFree(w->token_embedding_table);
-    cudaFree(w->rms_final_weight);
-    cudaFree(w->wcls);
+void free_weights(TransformerWeights* w, bool allocOnGpu) {
+    custom_free(w->token_embedding_table, allocOnGpu);
+    custom_free(w->rms_final_weight, allocOnGpu);
+    custom_free(w->wcls, allocOnGpu);
     for (int l = 0; l < w->num_layers; l++) {
         PerLayerWeight* layer = &(w->layers[l]);
-        cudaFree(layer->rms_att_weight);
-        cudaFree(layer->rms_ffn_weight);
-        freeQWeight(&layer->wq_q);
-        freeQWeight(&layer->wq_k);
-        freeQWeight(&layer->wq_v);
-        freeQWeight(&layer->wq_o);
-        freeQWeight(&layer->wq_gate);
-        freeQWeight(&layer->wq_up);
-        freeQWeight(&layer->wq_down);
+        custom_free(layer->rms_att_weight, allocOnGpu);
+        custom_free(layer->rms_ffn_weight, allocOnGpu);
+        freeQWeight(&layer->wq_q, allocOnGpu);
+        freeQWeight(&layer->wq_k, allocOnGpu);
+        freeQWeight(&layer->wq_v, allocOnGpu);
+        freeQWeight(&layer->wq_o, allocOnGpu);
+        freeQWeight(&layer->wq_gate, allocOnGpu);
+        freeQWeight(&layer->wq_up, allocOnGpu);
+        freeQWeight(&layer->wq_down, allocOnGpu);
     }
     free(w->layers);
 }
 
 // ----------------------------------------------------------------------------
 // initialization: read from checkpoint
-void readWeight(void* op, FILE* fp, size_t bytes, void* scratch) {
-    if (fread(scratch, 1, bytes, fp) != bytes) { printf("error reading weights");  exit(EXIT_FAILURE); }
-    cudaMemcpyAsync(op, scratch, bytes, cudaMemcpyHostToDevice);
+void readWeight(void* op, FILE* fp, size_t bytes) {
+    if (fread(op, 1, bytes, fp) != bytes) { 
+        printf("error reading weights");  
+        exit(EXIT_FAILURE); 
+    }
 }
 
-void uploadQWeight(QWeight& weight, FILE* fp, size_t height, size_t width, void* scratch) {
+void uploadQWeight(QWeight& weight, FILE* fp, size_t height, size_t width) {
     int meta_height = divUp(height, group_size);
     int packed_wt_height = getPackedWeightHeight(height);
     int packed_zeros_height = divUp(meta_height, 8);
 
-    readWeight(weight.weight, fp, packed_wt_height * width * sizeof(uint32_t), scratch);
-    readWeight(weight.zeros,  fp, packed_zeros_height * width * sizeof(uint32_t), scratch);
-    readWeight(weight.scales, fp, meta_height * width * sizeof(half), scratch);
+    readWeight(weight.weight, fp, packed_wt_height * width * sizeof(uint32_t));
+    readWeight(weight.zeros,  fp, packed_zeros_height * width * sizeof(uint32_t));
+    readWeight(weight.scales, fp, meta_height * width * sizeof(half));
 }
 
 int checkpoint_init_weights(TransformerWeights* w, Config* p, FILE* f) {
-    size_t scratch_size = std::max(p->vocab_size, p->hidden_dim) * p->dim;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    scratch_size *= sizeof(half);
-    void* scratchCpu = malloc(scratch_size);
 
     printf("\nLoading Weights... ");
 
-    readWeight(w->token_embedding_table, f, p->vocab_size * p->dim * sizeof(half), scratchCpu);
-    readWeight(w->wcls, f, p->vocab_size * p->dim * sizeof(half), scratchCpu);
-    readWeight(w->rms_final_weight, f, p->dim * sizeof(half), scratchCpu);
+    readWeight(w->token_embedding_table, f, p->vocab_size * p->dim * sizeof(half));
+    readWeight(w->wcls, f, p->vocab_size * p->dim * sizeof(half));
+    readWeight(w->rms_final_weight, f, p->dim * sizeof(half));
 
     // upload decoder block weight for each layer
     for (int i = 0; i < p->n_layers; i++) {
-        uploadQWeight(w->layers[i].wq_q, f, p->dim, p->dim, scratchCpu);
-        uploadQWeight(w->layers[i].wq_k, f, p->dim, kv_dim, scratchCpu);
-        uploadQWeight(w->layers[i].wq_v, f, p->dim, kv_dim, scratchCpu);
-        uploadQWeight(w->layers[i].wq_o, f, p->dim, p->dim, scratchCpu);
+        uploadQWeight(w->layers[i].wq_q, f, p->dim, p->dim);
+        uploadQWeight(w->layers[i].wq_k, f, p->dim, kv_dim);
+        uploadQWeight(w->layers[i].wq_v, f, p->dim, kv_dim);
+        uploadQWeight(w->layers[i].wq_o, f, p->dim, p->dim);
 
-        uploadQWeight(w->layers[i].wq_up  , f, p->dim, p->hidden_dim, scratchCpu);
-        uploadQWeight(w->layers[i].wq_gate, f, p->dim, p->hidden_dim, scratchCpu);
-        uploadQWeight(w->layers[i].wq_down, f, p->hidden_dim, p->dim, scratchCpu);
+        uploadQWeight(w->layers[i].wq_up  , f, p->dim, p->hidden_dim);
+        uploadQWeight(w->layers[i].wq_gate, f, p->dim, p->hidden_dim);
+        uploadQWeight(w->layers[i].wq_down, f, p->hidden_dim, p->dim);
 
-        readWeight(w->layers[i].rms_att_weight, f, p->dim * sizeof(half), scratchCpu);
-        readWeight(w->layers[i].rms_ffn_weight, f, p->dim * sizeof(half), scratchCpu);
+        readWeight(w->layers[i].rms_att_weight, f, p->dim * sizeof(half));
+        readWeight(w->layers[i].rms_ffn_weight, f, p->dim * sizeof(half));
     }
 
     printf("done!\n");
-    free(scratchCpu);
+    return 0;
+}
+
+void readWeight(void* op, void* src, size_t bytes) {
+    cudaMemcpyAsync(op, src, bytes, cudaMemcpyHostToDevice);
+}
+
+void uploadQWeight(QWeight& weight, QWeight& srcWeight, size_t height, size_t width) {
+    int meta_height = divUp(height, group_size);
+    int packed_wt_height = getPackedWeightHeight(height);
+    int packed_zeros_height = divUp(meta_height, 8);
+
+    readWeight(weight.weight, srcWeight.weight, packed_wt_height * width * sizeof(uint32_t));
+    readWeight(weight.zeros,  srcWeight.zeros, packed_zeros_height * width * sizeof(uint32_t));
+    readWeight(weight.scales, srcWeight.scales, meta_height * width * sizeof(half));
+}
+
+int checkpoint_init_weights(TransformerWeights* w, Config* p, TransformerWeights* w_src) {
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    
+    printf("\nLoading Weights... ");
+
+    readWeight(w->token_embedding_table, w_src->token_embedding_table, p->vocab_size * p->dim * sizeof(half));
+    readWeight(w->wcls, w_src->wcls, p->vocab_size * p->dim * sizeof(half));
+    readWeight(w->rms_final_weight, w_src->rms_final_weight, p->dim * sizeof(half));
+
+    // upload decoder block weight for each layer
+    for (int i = 0; i < p->n_layers; i++) {
+        uploadQWeight(w->layers[i].wq_q, w_src->layers[i].wq_q, p->dim, p->dim);
+        uploadQWeight(w->layers[i].wq_k, w_src->layers[i].wq_k, p->dim, kv_dim);
+        uploadQWeight(w->layers[i].wq_v, w_src->layers[i].wq_v, p->dim, kv_dim);
+        uploadQWeight(w->layers[i].wq_o, w_src->layers[i].wq_o, p->dim, p->dim);
+
+        uploadQWeight(w->layers[i].wq_up  , w_src->layers[i].wq_up, p->dim, p->hidden_dim);
+        uploadQWeight(w->layers[i].wq_gate, w_src->layers[i].wq_gate, p->dim, p->hidden_dim);
+        uploadQWeight(w->layers[i].wq_down, w_src->layers[i].wq_down, p->hidden_dim, p->dim);
+
+        readWeight(w->layers[i].rms_att_weight, w_src->layers[i].rms_att_weight, p->dim * sizeof(half));
+        readWeight(w->layers[i].rms_ffn_weight, w_src->layers[i].rms_ffn_weight, p->dim * sizeof(half));
+    }
+
+    printf("done!\n");
     return 0;
 }
 
 
 // ----------------------------------------------------------------------------
 // neural net blocks
-cudaStream_t stream;
+constexpr int MAX_GRAPHS = 8;
+struct PerGPUExecutionData
+{
+    cudaStream_t stream;
+    cudaGraphExec_t cudaGraphInstance[MAX_GRAPHS];
+    bool graphCaptured[MAX_GRAPHS] = { false };
+};
 
-void rmsnorm(half* o, half* x, half* weight, int size) {
+PerGPUExecutionData* streams;
+
+void rmsnorm(int rank, half* o, half* x, half* weight, int size) {
     int elementsPerThread = divUp(size, 1024);
-    rmsnorm_kernel <<< 1, 1024, 0, stream>>> (o, x, weight, size, elementsPerThread);
+    rmsnorm_kernel <<< 1, 1024, 0, streams[rank].stream>>> (o, x, weight, size, elementsPerThread);
 }
 
-void matmul(half* xout, half* x, half* w, int n, int d, int batch = 1, int x_stride = 0, int w_stride = 0, int op_stride = 0, int w_row_stride = -1, float alpha = 1.0f) {
+void matmul(int rank, half* xout, half* x, half* w, int n, int d, int batch = 1, int x_stride = 0, int w_stride = 0, int op_stride = 0, int w_row_stride = -1, float alpha = 1.0f) {
     if ((n & 7) || (d & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     int serialElements = divUp(n, 32);
     int serialLoads = divUp(serialElements, 8);     // we load 8 elements in parallel
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(d, 4), batch);
     if (w_row_stride == -1) w_row_stride = n;
-    mat_vec_kernel <<<grid_dim, block_dim, 0, stream >>> (xout, x, w, n, d, serialLoads, x_stride, w_stride, op_stride, w_row_stride, alpha);
+    mat_vec_kernel <<<grid_dim, block_dim, 0, streams[rank].stream >>> (xout, x, w, n, d, serialLoads, x_stride, w_stride, op_stride, w_row_stride, alpha);
 }
 
-void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false, int loff = -1, int *pPos = nullptr) {
+void matmul(int rank, half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false, int loff = -1, int *pPos = nullptr) {
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
@@ -229,10 +302,10 @@ void matmul(half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 1);
-    mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, loff, pPos);
+    mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, streams[rank].stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, loff, pPos);
 }
 
-void qkv_matvec(half* q, half *key_cache, half *value_cache, half* x, QWeight& qw, QWeight& kw, QWeight& vw, int inpSize, int opSize, int loff, int* pPos) {
+void qkv_matvec(int rank, half* q, half *key_cache, half *value_cache, half* x, QWeight& qw, QWeight& kw, QWeight& vw, int inpSize, int opSize, int loff, int* pPos) {
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
@@ -240,14 +313,14 @@ void qkv_matvec(half* q, half *key_cache, half *value_cache, half* x, QWeight& q
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 3);
-    qkv_matvec_kernel <<<grid_dim, block_dim, 0, stream >>> (q, key_cache, value_cache, x,
+    qkv_matvec_kernel <<<grid_dim, block_dim, 0, streams[rank].stream >>> (q, key_cache, value_cache, x,
                                                              qw.weight, qw.zeros, qw.scales, 
                                                              kw.weight, kw.zeros, kw.scales, 
                                                              vw.weight, vw.zeros, vw.scales, 
                                                              inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, loff, pPos);
 }
 
-void ffn_matvec_silu(half* xout, half* x, QWeight& gate_w, QWeight& up_w, int inpSize, int opSize) {
+void ffn_matvec_silu(int rank, half* xout, half* x, QWeight& gate_w, QWeight& up_w, int inpSize, int opSize) {
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
@@ -255,35 +328,35 @@ void ffn_matvec_silu(half* xout, half* x, QWeight& gate_w, QWeight& up_w, int in
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 1);
-    ffn_matvec_silu_kernel <<<grid_dim, block_dim, 0, stream >>> (xout, x, gate_w.weight, gate_w.zeros, gate_w.scales, 
+    ffn_matvec_silu_kernel <<<grid_dim, block_dim, 0, streams[rank].stream >>> (xout, x, gate_w.weight, gate_w.zeros, gate_w.scales, 
                                                                   up_w.weight, up_w.zeros, up_w.scales, 
                                                                   inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height);
 }
 
-void RoPERotation(half *q, half *k, int num_heads, int num_kv_heads, int head_size, int* pPos, int loff, float rope_theta) {
-    RoPERotation_kernel <<<num_heads, head_size / 2, 0, stream >>> (q, k, num_kv_heads, head_size, pPos, loff, rope_theta);
+void RoPERotation(int rank, half *q, half *k, int num_heads, int num_kv_heads, int head_size, int* pPos, int loff, float rope_theta) {
+    RoPERotation_kernel <<<num_heads, head_size / 2, 0, streams[rank].stream >>> (q, k, num_kv_heads, head_size, pPos, loff, rope_theta);
 }
 
-void MultiHeadAttention(half *output, half *q, half *key_cache, half * value_cache, half *att, int num_heads, int head_size, int kv_mul, int max_seq_len, int *pPos) {
+void MultiHeadAttention(int rank, half *output, half *q, half *key_cache, half * value_cache, half *att, int num_heads, int head_size, int kv_mul, int max_seq_len, int *pPos) {
     int dim = head_size * num_heads;
     // 1. Get attention scores
     int serialElements = divUp(head_size, 32);
     dim3 block_dim(32, 32);
     dim3 grid_dim1(divUp(max_seq_len, 32), num_heads);      // using max_seq_len instead of real seq_len here has measurable impact on perf (2%) :-/
-    mat_vec_kernel_simple <<< grid_dim1, block_dim, 0, stream >>> (att, q, key_cache, head_size, serialElements, head_size, head_size, dim / kv_mul, 1.0 / sqrt(head_size), pPos, kv_mul);
+    mat_vec_kernel_simple <<< grid_dim1, block_dim, 0, streams[rank].stream >>> (att, q, key_cache, head_size, serialElements, head_size, head_size, dim / kv_mul, 1.0 / sqrt(head_size), pPos, kv_mul);
 
     // 2. Run softmax kernel
     if (max_seq_len <= MAX_SEQ_LEN_SMEM_KERNEL)
-        softmax_kernel <<< num_heads, 1024, 0, stream >>> (att, num_heads, pPos);
+        softmax_kernel <<< num_heads, 1024, 0, streams[rank].stream >>> (att, num_heads, pPos);
     else
-        softmax_kernel_no_smem <<< num_heads, 1024, 0, stream >>> (att, num_heads, pPos);
+        softmax_kernel_no_smem <<< num_heads, 1024, 0, streams[rank].stream >>> (att, num_heads, pPos);
 
     // 3. weighted sum of the values to get the final result
     dim3 grid_dim2(divUp(head_size, 32), num_heads);
-    vec_mat_kernel <<< grid_dim2, block_dim, 0, stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim / kv_mul, kv_mul);
+    vec_mat_kernel <<< grid_dim2, block_dim, 0, streams[rank].stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim / kv_mul, kv_mul);
 }
 
-void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
+void run_llama_network(int rank, int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
     half* x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -291,64 +364,58 @@ void run_llama_network(int *pPos, Config* p, RunState* s, TransformerWeights* w,
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
 
-    copy_embedding_kernel <<<divUp(dim, 256), 256, 0, stream >>> (x, w->token_embedding_table, dim, s->shared_data->tokens, pPos);
+    copy_embedding_kernel <<<divUp(dim, 256), 256, 0, streams[rank].stream >>> (x, w->token_embedding_table, dim, s->shared_data->tokens, pPos);
 
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->layers[l].rms_att_weight, dim);
+        rmsnorm(rank, s->xb, x, w->layers[l].rms_att_weight, dim);
 
         // we directly store (key, value) at this time step (pos) to our kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
 
         // qkv matmuls for this position (opt: can be done in single kernel as batch of 3 - but only when num_kv_heads == num_heads)
         if (dim == kv_dim) {
-            qkv_matvec(s->q, s->key_cache, s->value_cache, s->xb, w->layers[l].wq_q, w->layers[l].wq_k, w->layers[l].wq_v, dim, dim, loff, pPos);
+            qkv_matvec(rank, s->q, s->key_cache, s->value_cache, s->xb, w->layers[l].wq_q, w->layers[l].wq_k, w->layers[l].wq_v, dim, dim, loff, pPos);
         }
         else {
-            matmul(s->q, s->xb, w->layers[l].wq_q, dim, dim);
-            matmul(s->key_cache, s->xb, w->layers[l].wq_k, dim, kv_dim, false, loff, pPos);
-            matmul(s->value_cache, s->xb, w->layers[l].wq_v, dim, kv_dim, false, loff, pPos);
+            matmul(rank, s->q, s->xb, w->layers[l].wq_q, dim, dim);
+            matmul(rank, s->key_cache, s->xb, w->layers[l].wq_k, dim, kv_dim, false, loff, pPos);
+            matmul(rank, s->value_cache, s->xb, w->layers[l].wq_v, dim, kv_dim, false, loff, pPos);
         }
 
         // apply RoPE rotation to the q and k vectors for each head
         // also save the output (key, value) at this time step (pos) to our kv cache
-        RoPERotation(s->q, s->key_cache, p->n_heads, p->n_kv_heads, head_size, pPos, loff, p->rope_theta);
+        RoPERotation(rank, s->q, s->key_cache, p->n_heads, p->n_kv_heads, head_size, pPos, loff, p->rope_theta);
 
         // apply MHA using the query and the key-value cache
-        MultiHeadAttention(s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, kv_mul, seq_len_bin, pPos);
+        MultiHeadAttention(rank, s->xb, s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads, head_size, kv_mul, seq_len_bin, pPos);
 
         // final matmul to get the output of the attention fused with residual connection back into x
-        matmul(s->x, s->xb, w->layers[l].wq_o, dim, dim, true);
+        matmul(rank, s->x, s->xb, w->layers[l].wq_o, dim, dim, true);
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->layers[l].rms_ffn_weight, dim);
-
+        rmsnorm(rank, s->xb, x, w->layers[l].rms_ffn_weight, dim);
         // apply gate proj and up proj and then the silu activation in a single fused kernel
-        ffn_matvec_silu(s->hb, s->xb, w->layers[l].wq_gate, w->layers[l].wq_up, dim, hidden_dim);
+        ffn_matvec_silu(rank, s->hb, s->xb, w->layers[l].wq_gate, w->layers[l].wq_up, dim, hidden_dim);
 
         // final matmul (down proj) to get the output of the ffn fused with residual connection back into x
-        matmul(s->x, s->hb, w->layers[l].wq_down, hidden_dim, dim, true);
+        matmul(rank, s->x, s->hb, w->layers[l].wq_down, hidden_dim, dim, true);
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
-
+    rmsnorm(rank, x, x, w->rms_final_weight, dim);
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(rank, s->logits, x, w->wcls, p->dim, p->vocab_size);
 }
 
-constexpr int MAX_GRAPHS = 8;
-cudaGraphExec_t cudaGraphInstance[MAX_GRAPHS];
-bool graphCaptured[MAX_GRAPHS];
-
-void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
+void run_transformer(int rank, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    cudaEventRecord(start, stream);
+    cudaEventRecord(start, streams[rank].stream);
 #endif
 
     int seq_len = s->shared_data->pos + 1;
@@ -359,32 +426,32 @@ void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights*
         if (seq_len <= seq_len_bin) break;
     if ((seq_len > seq_len_bin) || (graphIndex == MAX_GRAPHS - 1)) seq_len_bin = p->seq_len;    // last bin holds max seq len
 
-    if (!graphCaptured[graphIndex])
+    if (!streams[rank].graphCaptured[graphIndex])
     {
         cudaGraph_t graph = {};
-        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-        run_llama_network(s->pos, p, s, w, seq_len_bin);
-        cudaStreamEndCapture(stream, &graph);
-        cudaGraphInstantiate(&cudaGraphInstance[graphIndex], graph, 0);
-        cudaGraphDestroy(graph);
-        graphCaptured[graphIndex] = true;
+        CUDA_CHECK(cudaStreamBeginCapture(streams[rank].stream, cudaStreamCaptureModeThreadLocal));
+        run_llama_network(rank, s->pos, p, s, w, seq_len_bin);
+        CUDA_CHECK(cudaStreamEndCapture(streams[rank].stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&streams[rank].cudaGraphInstance[graphIndex], graph, 0));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        streams[rank].graphCaptured[graphIndex] = true;
     }
-    cudaGraphLaunch(cudaGraphInstance[graphIndex], stream);
+    cudaGraphLaunch(streams[rank].cudaGraphInstance[graphIndex], streams[rank].stream);
 #else
-    run_llama_network(s->pos, p, s, w, seq_len);
+    run_llama_network(rank, s->pos, p, s, w, seq_len);
 #endif
 
     if (copyLogits) {
         // copy to the right slot in logits_array (and convert to FP32)
         // we compute perplexity on the CPU later.
         float* pOutput = s->logits_array + p->vocab_size * s->shared_data->pos;
-        convert_fp16_to_fp32 << < divUp(p->vocab_size, 128), 128, 0, stream >> > (pOutput, s->logits, p->vocab_size);
+        convert_fp16_to_fp32 << < divUp(p->vocab_size, 128), 128, 0, streams[rank].stream >> > (pOutput, s->logits, p->vocab_size);
     }
 
-    sample(pSampler, s, gen_token, stream);
+    sample(rank, pSampler, s, gen_token, streams[rank].stream);
 
 #if DUMP_PER_TOKEN_TIMINGS == 1
-    cudaEventRecord(stop, stream);
+    cudaEventRecord(stop, streams[rank].stream);
     cudaEventSynchronize(stop);
     float time = 0;
     cudaEventElapsedTime(&time, start, stop);
@@ -404,8 +471,19 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
+void init_transformer(Transformer* t, bool perplexity, int rank)
+{
+    cudaSetDevice(rank);
+    // read in the Transformer weights
+    malloc_weights(&(t->pInfo[rank].d_weights), &t->config, true);
+    if (checkpoint_init_weights(&(t->pInfo[rank].d_weights), &t->config, &t->h_weights)) { exit(1); }
 
-void build_transformer(Transformer* t, char* checkpoint_path, bool perplexity) {
+    malloc_run_state(&(t->pInfo[rank].state), &t->config, perplexity);
+
+    cudaDeviceSynchronize();
+}
+
+void build_transformer(Transformer* t, int gpu_count, char* checkpoint_path, bool perplexity) {
     // read in the model.bin file
     FILE* file = nullptr;
     file = fopen(checkpoint_path, "rb");
@@ -416,24 +494,114 @@ void build_transformer(Transformer* t, char* checkpoint_path, bool perplexity) {
     printf("\nModel params:- \ndim: %d \nhidden_dim: %d\nn_heads: %d\nn_kv_heads: %d\nn_layers: %d\nseq_len: %d\nvocab_size: %d\nrope_theta: %g\n",
         t->config.dim, t->config.hidden_dim, t->config.n_heads, t->config.n_kv_heads, t->config.n_layers, t->config.seq_len, t->config.vocab_size, t->config.rope_theta);
 
+    t->gpu_count = gpu_count;
+    t->pInfo = new PerThreadInfo[gpu_count];
+    ncclGetUniqueId(&t->ncclId);
+
     // read in the Transformer weights
-    malloc_weights(&t->weights, &t->config);
-    if (checkpoint_init_weights(&t->weights, &t->config, file)) { exit(1); }
+    malloc_weights(&(t->h_weights), &t->config, false);
+    if (checkpoint_init_weights(&(t->h_weights), &t->config, file)) { exit(1); }
 
-    malloc_run_state(&t->state, &t->config, perplexity);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < gpu_count; i++) {
+        threads.push_back(std::thread(init_transformer, t, perplexity, i));
+    }
 
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    free_weights(&(t->h_weights), false);
     fclose(file);
+}
+
+void free_transformer_thread(Transformer* t, int rank) {
+    cudaSetDevice(rank);
+    free_run_state(&(t->pInfo[rank].state));
+    free_weights(&(t->pInfo[rank].d_weights), true);
+    cudaDeviceSynchronize();
 }
 
 void free_transformer(Transformer* t) {
     // free the RunState buffers
-    free_run_state(&t->state);
-    free_weights(&t->weights);
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < t->gpu_count; i++) {
+        threads.push_back(std::thread(free_transformer_thread, t, i));
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
 }
 
 // ----------------------------------------------------------------------------
 // generation loop
-void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps) {
+
+void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, int* prompt_tokens, int num_prompt_tokens, int steps, int rank, int gpu_count) {
+
+    // start the main loop
+    long start = time_in_ms();    // used to time our code
+
+    cudaSetDevice(rank);
+
+    ncclComm_t comm;
+    ncclCommInitRank(&comm, gpu_count, transformer->ncclId, rank);
+
+    cudaStreamCreate(&streams[rank].stream);
+
+    int next;                     // will store the next token in the sequence
+    int token = prompt_tokens[0]; // kick off with the first token in the prompt
+    int pos = 0;                  // position in the sequence
+
+    // copy the prompt tokens into shared list of tokens (so that GPU can access them).
+    // init state
+    cudaMemset(transformer->pInfo[rank].state.pos, 0, sizeof(int));
+    transformer->pInfo[rank].state.shared_data->pos = 0;
+    memcpy(&transformer->pInfo[rank].state.shared_data->tokens, prompt_tokens, sizeof(int) * num_prompt_tokens);
+
+    while (pos < steps) {
+        // wait for GPU work for previous iteration to complete
+        // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
+        cudaStreamSynchronize(streams[rank].stream);
+        // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
+        run_transformer(rank, pos >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
+
+        if (pos > 0) {
+            next = transformer->pInfo[rank].state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
+            if (next >= transformer->config.vocab_size) next = 0;   // skip garbage tokens (can happen with NANs)
+
+            if(rank == 1)
+            {
+                char* piece = decode(tokenizer, token, next);
+                safe_printf(piece);             // same as printf("%s", piece), but skips "unsafe" bytes
+            }
+            if (next == eos_token) break;   // break if EOS token is reached
+            // advance forward
+            token = next;
+        }
+        pos++;
+    }
+
+    ncclCommDestroy(comm);
+
+#if USE_CUDA_GRAPHS
+    for (int i = 0; i < MAX_GRAPHS; i++)
+        if (streams[rank].graphCaptured[i]) cudaGraphExecDestroy(streams[rank].cudaGraphInstance[i]);
+#endif
+
+    if(rank == 1)
+    {
+        printf("\n");
+
+        // report achieved tok/s
+        long end = time_in_ms();
+        double time = (end - start) / 1000.0;
+        int timed_tokens = pos - 1;
+        printf("\nachieved tok/s: %f. Tokens: %d, seconds: %g\n", timed_tokens / time, timed_tokens, time);
+    }
+}
+
+void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps, int gpu_count) {
     char empty_prompt[] = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -450,43 +618,14 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
         exit(EXIT_FAILURE);
     }
 
-    // start the main loop
-    long start = time_in_ms();    // used to time our code
-    int next;                     // will store the next token in the sequence
-    int token = prompt_tokens[0]; // kick off with the first token in the prompt
-    int pos = 0;                  // position in the sequence
-
-    // copy the prompt tokens into shared list of tokens (so that GPU can access them).
-    // init state
-    cudaMemset(transformer->state.pos, 0, sizeof(int));
-    transformer->state.shared_data->pos = 0;
-    memcpy(&transformer->state.shared_data->tokens, prompt_tokens, sizeof(int) * num_prompt_tokens);
-
-    while (pos < steps) {
-        // wait for GPU work for previous iteration to complete
-        // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
-        cudaStreamSynchronize(stream);
-        // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
-        run_transformer(pos >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler); // forward the transformer to get next token
-
-        if (pos > 0) {
-            next = transformer->state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
-            if (next >= transformer->config.vocab_size) next = 0;   // skip garbage tokens (can happen with NANs)
-            char* piece = decode(tokenizer, token, next);
-            safe_printf(piece);             // same as printf("%s", piece), but skips "unsafe" bytes
-            if (next == eos_token) break;   // break if EOS token is reached
-            // advance forward
-            token = next;
-        }
-        pos++;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < gpu_count; i++) {
+        threads.push_back(std::thread(generate_thread, transformer, tokenizer, sampler, prompt_tokens, num_prompt_tokens, steps, i, gpu_count));
     }
-    printf("\n");
 
-    // report achieved tok/s
-    long end = time_in_ms();
-    double time = (end - start) / 1000.0;
-    int timed_tokens = pos - 1;
-    printf("\nachieved tok/s: %f. Tokens: %d, seconds: %g\n", timed_tokens / time, timed_tokens, time);
+    for (auto& t : threads) {
+        t.join();
+    }
 
     free(prompt_tokens);
 }
@@ -522,9 +661,11 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
     int token;       // stores the current token to feed into the transformer
     int pos = 0;     // position in the sequence
 
+    int rank = 0;
+
     // init GPU state
-    cudaMemset(transformer->state.pos, pos, sizeof(int));
-    transformer->state.shared_data->pos = pos;
+    cudaMemset(transformer->pInfo[rank].state.pos, pos, sizeof(int));
+    transformer->pInfo[rank].state.shared_data->pos = pos;
 
     while (pos < steps) {
 
@@ -570,18 +711,18 @@ void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
             printf("Assistant: ");
 
             // copy encoded tokens to GPU
-            memcpy(&transformer->state.shared_data->tokens[pos], prompt_tokens, sizeof(int) * num_prompt_tokens);
+            memcpy(&transformer->pInfo[rank].state.shared_data->tokens[pos], prompt_tokens, sizeof(int) * num_prompt_tokens);
         }
 
         // wait for GPU work for previous iteration to complete
         // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
-        cudaStreamSynchronize(stream);
-        run_transformer(user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->state, &transformer->weights, false, sampler); // forward the transformer to get next token
+        cudaStreamSynchronize(streams[rank].stream);
+        run_transformer(rank, user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
 
         user_idx++;
 
         if (user_idx > 0) {
-            next = transformer->state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
+            next = transformer->pInfo[rank].state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
             if (next == eos_token) { 
                 user_turn = 1;  // EOS token ends the Assistant turn
                 printf("\n");
@@ -618,8 +759,32 @@ void error_usage(char *argv[]) {
     exit(EXIT_FAILURE);
 }
 
+int get_and_print_gpu_info()
+{
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    if (device_count == 0) {
+        printf("No CUDA devices found!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Found %d CUDA devices\n", device_count);
+    for (int dev = 0; dev < device_count; dev++) {
+        cudaDeviceProp device_prop;
+        cudaGetDeviceProperties(&device_prop, dev);
+        printf("Device %d: %s\n", dev, device_prop.name);
+        printf("  Compute capability: %d.%d\n", device_prop.major, device_prop.minor);
+        printf("  Total global memory: %.2f GB\n", (float)device_prop.totalGlobalMem / (1024.0f * 1024.0f * 1024.0f));
+        printf("  Multiprocessors: %d\n", device_prop.multiProcessorCount);
+        printf("\n");
+    }
+    return device_count;
+}
+
 // ----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
+
+    int gpu_count = get_and_print_gpu_info();
 
     // default parameters
     char* checkpoint_path = NULL;  // e.g. out/model.bin
@@ -686,7 +851,7 @@ int main(int argc, char *argv[]) {
 
     // build the Transformer via the model .bin file
     Transformer transformer;
-    build_transformer(&transformer, checkpoint_path, perplexity);
+    build_transformer(&transformer, gpu_count, checkpoint_path, perplexity);
     if (steps <= 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
     // create and init the tokenizer
@@ -695,14 +860,14 @@ int main(int argc, char *argv[]) {
 
     // build the Sampler
     Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
+    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed, gpu_count);
 
-    cudaStreamCreate(&stream);
+    streams = new PerGPUExecutionData[gpu_count];
 
     if (perplexity)
-        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &transformer.config, &transformer.state, &transformer.weights, &sampler);
+        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &transformer.config, &transformer.pInfo[0].state, &transformer.pInfo[0].d_weights, &sampler);
     else if (strcmp(mode, "generate") == 0)
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
+        generate(&transformer, &tokenizer, &sampler, prompt, steps, gpu_count);
     else if (strcmp(mode, "chat") == 0)
         chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
     else
@@ -710,10 +875,6 @@ int main(int argc, char *argv[]) {
 
     // memory cleanup
     free_transformer(&transformer);
-#if USE_CUDA_GRAPHS
-    for (int i = 0; i < MAX_GRAPHS; i++)
-        if (graphCaptured[i]) cudaGraphExecDestroy(cudaGraphInstance[i]);
-#endif
 
     free_tokenizer(&tokenizer);
     return 0;

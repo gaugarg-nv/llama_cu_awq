@@ -51,7 +51,7 @@ float compute_perplexity(int* tokens, float* logits, int num_tokens, int vocab_s
 }
 
 
-void run_transformer(bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler* pSampler);
+void run_transformer(int rank, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler* pSampler);
 
 // ----------------------------------------------------------------------------
 float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config, RunState* state, TransformerWeights* weights, Sampler *pSampler) {
@@ -77,7 +77,7 @@ float get_dataset_perplexity(char* dataset, Tokenizer* tokenizer, Config* config
     state->shared_data->pos = 0;
     state->shared_data->tokens[0] = bos_token;
     for (int pos = 0; pos < numTokens; pos++) {
-        run_transformer(false, config, state, weights, true, pSampler);
+        run_transformer(0, false, config, state, weights, true, pSampler);
         cudaDeviceSynchronize();
     }
     printf("done!\n");

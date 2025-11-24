@@ -376,7 +376,7 @@ __global__ void softmax_kernel(half* __restrict__ arr, int num_heads, int* pPos)
         if (att[i] > max_val)
             max_val = att[i];
 
-    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    max_val = BlockReduce(temp).Reduce(max_val, ::cuda::maximum());
     if (threadIdx.x == 0)
         shared_val = max_val;
     __syncthreads();
@@ -419,7 +419,7 @@ __global__ void softmax_kernel_no_smem(half* arr, int num_heads, int* pPos) {
             max_val = val;
     }
 
-    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    max_val = BlockReduce(temp).Reduce(max_val, ::cuda::maximum());
     if (threadIdx.x == 0)
         shared_val = max_val;
     __syncthreads();
@@ -465,7 +465,7 @@ __global__ void argmax_kernel(half* __restrict__ x, int size, int* result, volat
 
     // find the global max value
     float global_max_val;
-    global_max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    global_max_val = BlockReduce(temp).Reduce(max_val, ::cuda::maximum());
     if (threadIdx.x == 0)
         shared_val = global_max_val;
     __syncthreads();
@@ -524,7 +524,7 @@ __global__ void softmax_logits_kernel(half* __restrict__ logits, int size, float
         if ((float)logits[i] > max_val)
             max_val = logits[i];
 
-    max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+    max_val = BlockReduce(temp).Reduce(max_val, ::cuda::maximum());
     if (threadIdx.x == 0)
         shared_val = max_val;
     __syncthreads();
@@ -570,7 +570,7 @@ __global__ void sample_top_p_kernel(half* sorted_logits_prefix_sum, int* indices
     // find the min across the block
     using BlockReduce = cub::BlockReduce<int, 1024>;
     __shared__ typename BlockReduce::TempStorage temp;
-    int min_index_global = BlockReduce(temp).Reduce(min_index, cub::Min());
+    int min_index_global = BlockReduce(temp).Reduce(min_index, ::cuda::minimum());
     if (threadIdx.x == 0)
     {
         int token_pos = *pPos;
