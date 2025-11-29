@@ -104,6 +104,14 @@ __global__ void rmsnorm_kernel(half* o, half* x, half* weight, int size, int ele
     }
 }
 
+__global__ void skip_connection_kernel(half* xout, half* x, half* skip, int n) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n) {
+        float val = (float)x[index] + (float)skip[index];
+        xout[index] = (half)val;
+    }
+}
+
 
 // Only used for the final linear layer to get logits (for most other layers we use the INT4 version below)
 __global__ void mat_vec_kernel(half* op, const half* ip, const half* wt, int n, int d, int numSerialLoads,
