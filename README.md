@@ -25,6 +25,7 @@ You can use one of these models:
 
 * 7B: [Llama-2-7b-chat-hf-w4-g128-awq](https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-7b-chat-hf-w4-g128-awq)
 * 13B: [Llama-2-13b-chat-hf-w4-g128-awq](https://huggingface.co/abhinavkulkarni/meta-llama-Llama-2-13b-chat-hf-w4-g128-awq)
+* 33B: [Vicuna-33b-v1.3-w4-g128-awq](https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq)
 
 Here are the commands for the 7B model:
 
@@ -56,6 +57,31 @@ python3 convert_awq_to_bin.py pytorch_model-00003-of-00003.bin output
 
 ./llama2_q4 llama2-13b-awq-q4.bin -n 256 -i "write an essay about GPUs"
 ```
+
+And for the 33B model:
+
+```
+wget https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq/resolve/main/config.json
+wget https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq/resolve/main/pytorch_model-00001-of-00006.bin
+wget https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq/resolve/main/pytorch_model-00002-of-00006.bin
+wget https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq/resolve/main/pytorch_model-00003-of-00006.bin
+wget https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq/resolve/main/pytorch_model-00004-of-00006.bin
+wget https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq/resolve/main/pytorch_model-00005-of-00006.bin
+wget https://huggingface.co/abhinavkulkarni/lmsys-vicuna-33b-v1.3-w4-g128-awq/resolve/main/pytorch_model-00006-of-00006.bin
+
+pip install numpy torch
+python3 convert_awq_to_bin.py pytorch_model-00001-of-00006.bin output
+python3 convert_awq_to_bin.py pytorch_model-00002-of-00006.bin output
+python3 convert_awq_to_bin.py pytorch_model-00003-of-00006.bin output
+python3 convert_awq_to_bin.py pytorch_model-00004-of-00006.bin output
+python3 convert_awq_to_bin.py pytorch_model-00005-of-00006.bin output
+python3 convert_awq_to_bin.py pytorch_model-00006-of-00006.bin output
+
+./weight_packer config.json output vicuna-33b-awq-q4.bin 1
+
+./llama2_q4 vicuna-33b-awq-q4.bin -n 256 -i "write an essay about GPUs"
+```
+
 Note: the last argument of weight_packer is used to indicate whether the awq weights are using old packing format (that need repacking). If you use latest AWQ repo from github, it will generate weights in new packing format. The weights at https://huggingface.co/abhinavkulkarni/ are still using old format so we are setting the param to 1 above.
 
 
@@ -113,13 +139,15 @@ achieved tok/s: 200.787402. Tokens: 255, seconds: 1.27
 ## Multi-GPU support
 
 The application shows column-wise and hybrid split strategy
-* column-wise split strategy adds total 4 AllGather in each decoder layer - before, after O-proj and before, after FFN-down
-* hybrid split strategy adds total 2 AllReduce in each decoder layer - after O-proj and after FFN-down
+* column-wise split strategy adds total 4 AllGather in each decoder layer - before, after O-proj and before, after FFN-down. This strategy split all linear layers along column (K-dimension).
+* hybrid split strategy adds total 2 AllReduce in each decoder layer - after O-proj and after FFN-down. This strategy splits qkv/ffn-up-gate along column and O-proj/ffn-down along row (along N dimension).
 
 The strategy can be controlled with `-x` command line option.
-- ``x "none"`: Run on single GPU
+- `-x "none"`: Run on single GPU
 - `-x "column"` : Column wise split strategy
 - `-x "hybrid"` : Hyrid split strategy
+
+The larger models show highest scaling. In my experiments, I have found hybrid strategy to perform better than column-wise split.
 
 ## License
 
