@@ -27,11 +27,10 @@ Inference for Llama-2 Transformer model in pure Cuda.
 #include "gpu_kernels.h"
 #include "tokenizer.h"
 #include "sampler.h"
-#include "perplexity.h"
 
 constexpr int group_size = 128; // hardcoded for this implementation
 #define DUMP_PER_TOKEN_TIMINGS 0
-#define USE_CUDA_GRAPHS 0
+#define USE_CUDA_GRAPHS 1
 
 #define CUDA_CHECK(call) \
 do { \
@@ -42,6 +41,20 @@ do { \
         exit(EXIT_FAILURE); \
     } \
 } while (0)
+
+enum TP_MODE
+{
+    TP_NONE,
+    TP_COLUMN,
+    TP_HYBRID
+};
+
+enum Split
+{
+    ROW_WISE,
+    COLUMN_WISE,
+    NONE
+};
 
 // ----------------------------------------------------------------------------
 // Transformer and RunState structs, and related memory management
@@ -128,7 +141,7 @@ void freeQWeight(QWeight* pWeight, bool allocOnGpu) {
     custom_free(pWeight->scales, allocOnGpu);
 }
 
-void malloc_weights(TransformerWeights* w, Config* p, int numGPUs, bool allocOnGpu) {
+void malloc_weights(TransformerWeights* w, Config* p, int numGPUs, bool allocOnGpu, TP_MODE tp_mode) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     custom_malloc((void**)&w->token_embedding_table, p->vocab_size * p->dim * sizeof(half), allocOnGpu);
     w->layers = (PerLayerWeight*)malloc(p->n_layers * sizeof(PerLayerWeight));
@@ -141,11 +154,18 @@ void malloc_weights(TransformerWeights* w, Config* p, int numGPUs, bool allocOnG
         allocQWeight(&layer->wq_q, p->dim, p->dim / numGPUs, allocOnGpu);
         allocQWeight(&layer->wq_k, p->dim, kv_dim / numGPUs, allocOnGpu);
         allocQWeight(&layer->wq_v, p->dim, kv_dim / numGPUs, allocOnGpu);
-        allocQWeight(&layer->wq_o, p->dim, p->dim / numGPUs, allocOnGpu);
+
+        if(tp_mode == TP_HYBRID)
+            allocQWeight(&layer->wq_o, p->dim / numGPUs, p->dim, allocOnGpu);
+        else
+            allocQWeight(&layer->wq_o, p->dim, p->dim / numGPUs, allocOnGpu);
         allocQWeight(&layer->wq_gate, p->dim, p->hidden_dim / numGPUs, allocOnGpu);
         allocQWeight(&layer->wq_up, p->dim, p->hidden_dim / numGPUs, allocOnGpu);
-        //allocQWeight(&layer->wq_down, p->hidden_dim / numGPUs, p->dim, allocOnGpu);
-        allocQWeight(&layer->wq_down, p->hidden_dim, p->dim / numGPUs, allocOnGpu);
+
+        if(tp_mode == TP_HYBRID)
+            allocQWeight(&layer->wq_down, p->hidden_dim / numGPUs, p->dim, allocOnGpu);
+        else
+            allocQWeight(&layer->wq_down, p->hidden_dim, p->dim / numGPUs, allocOnGpu);
     }
 
     custom_malloc((void**)&w->rms_final_weight, p->dim * sizeof(half), allocOnGpu);
@@ -229,27 +249,6 @@ void readWeight(void* op, void* src, size_t bytes) {
     cudaMemcpyAsync(op, src, bytes, cudaMemcpyHostToDevice);
 }
 
-void uploadQWeight(QWeight& weight, QWeight& srcWeight, size_t srcheight, size_t dstheight, size_t width) {
-    int src_meta_height = divUp(srcheight, group_size);
-    int src_packed_wt_height = getPackedWeightHeight(srcheight);
-    int src_packed_zeros_height = divUp(src_meta_height, 8);
-
-    int dst_meta_height = divUp(dstheight, group_size);
-    int dst_packed_wt_height = getPackedWeightHeight(dstheight);
-    int dst_packed_zeros_height = divUp(dst_meta_height, 8);
-
-    cudaMemcpy2DAsync(weight.weight, dst_packed_wt_height * sizeof(uint32_t),
-                        srcWeight.weight, src_packed_wt_height * sizeof(uint32_t),
-                        dst_packed_wt_height * sizeof(uint32_t), width, cudaMemcpyHostToDevice);
-}
-
-enum Split
-{
-    ROW_WISE,
-    COLUMN_WISE,
-    NONE
-};
-
 void uploadQWeight(QWeight& weight, QWeight& srcWeight, size_t height, size_t width, Split split, int rank, int gpu_count) {
 
     if(split == COLUMN_WISE)
@@ -261,6 +260,28 @@ void uploadQWeight(QWeight& weight, QWeight& srcWeight, size_t height, size_t wi
         readWeight(weight.weight, srcWeight.weight + rank * (packed_wt_height * width / gpu_count), packed_wt_height * width * sizeof(uint32_t) / gpu_count);
         readWeight(weight.zeros,  srcWeight.zeros + rank * (packed_zeros_height * width / gpu_count), packed_zeros_height * width * sizeof(uint32_t) / gpu_count);
         readWeight(weight.scales, srcWeight.scales + rank * (meta_height * width / gpu_count), meta_height * width * sizeof(half) / gpu_count);
+    }
+    else if(split == ROW_WISE)
+    {
+        int src_meta_height = divUp(height, group_size);
+        int src_packed_wt_height = getPackedWeightHeight(height);
+        int src_packed_zeros_height = divUp(src_meta_height, 8);
+
+        int dst_meta_height = divUp(height / gpu_count, group_size);
+        int dst_packed_wt_height = getPackedWeightHeight(height / gpu_count);
+        int dst_packed_zeros_height = divUp(dst_meta_height, 8);
+
+        cudaMemcpy2DAsync(weight.weight, dst_packed_wt_height * sizeof(uint32_t),
+                            srcWeight.weight + rank * (src_packed_wt_height / gpu_count), src_packed_wt_height * sizeof(uint32_t),
+                            dst_packed_wt_height * sizeof(uint32_t), width, cudaMemcpyHostToDevice);
+
+        cudaMemcpy2DAsync(weight.zeros, dst_packed_zeros_height * sizeof(uint32_t),
+                          ((uint8_t*)srcWeight.zeros) + rank * (src_meta_height / (2 * gpu_count)), src_packed_zeros_height * sizeof(uint32_t),
+                            dst_packed_zeros_height * sizeof(uint32_t), width, cudaMemcpyHostToDevice);
+
+        cudaMemcpy2DAsync(weight.scales, dst_meta_height * sizeof(half),
+                            srcWeight.scales + rank * (src_meta_height / gpu_count), src_meta_height * sizeof(half),
+                            dst_meta_height * sizeof(half), width, cudaMemcpyHostToDevice);
     }
     else
     {
@@ -275,7 +296,7 @@ void uploadQWeight(QWeight& weight, QWeight& srcWeight, size_t height, size_t wi
 }
 
 
-int checkpoint_init_weights(TransformerWeights* w, Config* p, TransformerWeights* w_src, int rank, int gpu_count) {
+int checkpoint_init_weights(TransformerWeights* w, Config* p, TransformerWeights* w_src, int rank, int gpu_count, TP_MODE tp_mode) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     
     printf("\nLoading Weights... ");
@@ -289,11 +310,18 @@ int checkpoint_init_weights(TransformerWeights* w, Config* p, TransformerWeights
         uploadQWeight(w->layers[i].wq_q, w_src->layers[i].wq_q, p->dim, p->dim, COLUMN_WISE, rank, gpu_count);
         uploadQWeight(w->layers[i].wq_k, w_src->layers[i].wq_k, p->dim, kv_dim, COLUMN_WISE, rank, gpu_count);
         uploadQWeight(w->layers[i].wq_v, w_src->layers[i].wq_v, p->dim, kv_dim, COLUMN_WISE, rank, gpu_count);
-        uploadQWeight(w->layers[i].wq_o, w_src->layers[i].wq_o, p->dim, p->dim, COLUMN_WISE, rank, gpu_count);
+        if(tp_mode == TP_HYBRID)
+            uploadQWeight(w->layers[i].wq_o, w_src->layers[i].wq_o, p->dim, p->dim, ROW_WISE, rank, gpu_count);
+        else
+            uploadQWeight(w->layers[i].wq_o, w_src->layers[i].wq_o, p->dim, p->dim, COLUMN_WISE, rank, gpu_count);
 
         uploadQWeight(w->layers[i].wq_up  , w_src->layers[i].wq_up, p->dim, p->hidden_dim, COLUMN_WISE, rank, gpu_count);
         uploadQWeight(w->layers[i].wq_gate, w_src->layers[i].wq_gate, p->dim, p->hidden_dim, COLUMN_WISE, rank, gpu_count);
-        uploadQWeight(w->layers[i].wq_down, w_src->layers[i].wq_down, p->hidden_dim, p->dim, COLUMN_WISE, rank, gpu_count);
+
+        if(tp_mode == TP_HYBRID)
+            uploadQWeight(w->layers[i].wq_down, w_src->layers[i].wq_down, p->hidden_dim, p->dim, ROW_WISE, rank, gpu_count);
+        else
+            uploadQWeight(w->layers[i].wq_down, w_src->layers[i].wq_down, p->hidden_dim, p->dim, COLUMN_WISE, rank, gpu_count);
 
         readWeight(w->layers[i].rms_att_weight, w_src->layers[i].rms_att_weight, p->dim * sizeof(half));
         readWeight(w->layers[i].rms_ffn_weight, w_src->layers[i].rms_ffn_weight, p->dim * sizeof(half));
@@ -336,7 +364,7 @@ void matmul(int rank, half* xout, half* x, half* w, int n, int d, int batch = 1,
     mat_vec_kernel <<<grid_dim, block_dim, 0, streams[rank].stream >>> (xout, x, w, n, d, serialLoads, x_stride, w_stride, op_stride, w_row_stride, alpha);
 }
 
-void matmul(int rank, half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false, int loff = -1, int *pPos = nullptr) {
+void matmul(int rank, half* xout, half* x, QWeight &w, int inpSize, int opSize, bool accum = false, int gpu_count = 1, int loff = -1, int *pPos = nullptr) {
     if ((inpSize & 7) || (opSize & 7)) { printf("\nUnsupported matmul size. Exiting\n"); exit(EXIT_FAILURE); }
     // We are assuming a vector - matrix mul with col major matrix: height = inpSize,  width  = opSize
     int scales_height = divUp(inpSize, 128);
@@ -344,7 +372,7 @@ void matmul(int rank, half* xout, half* x, QWeight &w, int inpSize, int opSize, 
     int packed_zeros_height = divUp(scales_height, 8);
     dim3 block_dim(32, 4);
     dim3 grid_dim(divUp(opSize, 4), 1);
-    mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, streams[rank].stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, loff, pPos);
+    mat_vec_kernel_int4 <<<grid_dim, block_dim, 0, streams[rank].stream >>> (xout, x, w.weight, w.zeros, w.scales, inpSize, opSize, packed_zeros_height, scales_height, packed_wt_height, accum, gpu_count, loff, pPos);
 }
 
 void qkv_matvec(int rank, half* q, half *key_cache, half *value_cache, half* x, QWeight& qw, QWeight& kw, QWeight& vw, int inpSize, int opSize, int loff, int* pPos) {
@@ -398,7 +426,7 @@ void MultiHeadAttention(int rank, half *output, half *q, half *key_cache, half *
     vec_mat_kernel <<< grid_dim2, block_dim, 0, streams[rank].stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim / kv_mul, kv_mul);
 }
 
-void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin) {
+void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin, TP_MODE tp_mode) {
     half* x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -423,8 +451,8 @@ void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPo
         }
         else {
             matmul(rank, s->q, s->xb, w->layers[l].wq_q, dim, dim / gpu_count);
-            matmul(rank, s->key_cache, s->xb, w->layers[l].wq_k, dim, kv_dim / gpu_count, false, loff, pPos);
-            matmul(rank, s->value_cache, s->xb, w->layers[l].wq_v, dim, kv_dim / gpu_count, false, loff, pPos);
+            matmul(rank, s->key_cache, s->xb, w->layers[l].wq_k, dim, kv_dim / gpu_count, false, 1, loff, pPos);
+            matmul(rank, s->value_cache, s->xb, w->layers[l].wq_v, dim, kv_dim / gpu_count, false, 1, loff, pPos);
         }
 
         // apply RoPE rotation to the q and k vectors for each head
@@ -434,31 +462,38 @@ void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPo
         // apply MHA using the query and the key-value cache
         MultiHeadAttention(rank, s->xb + rank * (dim / gpu_count), s->q, s->key_cache + loff, s->value_cache + loff, s->att, p->n_heads / gpu_count, head_size, kv_mul, seq_len_bin, pPos);
 
-        if(gpu_count > 1)
+        // final matmul to get the output of the attention fused with residual connection back into x
+        if(tp_mode == TP_HYBRID)
+        {
+            matmul(rank, s->x, s->xb + rank * (dim / gpu_count), w->layers[l].wq_o, dim / gpu_count, dim, true, gpu_count);
+            ncclAllReduce(s->x, s->x, dim, ncclHalf, ncclSum, comm, streams[rank].stream);
+        }
+        else
+        {
             ncclAllGather(s->xb + rank * (dim / gpu_count), s->xb, dim / gpu_count, ncclHalf, comm, streams[rank].stream);
 
-        // final matmul to get the output of the attention fused with residual connection back into x
-        matmul(rank, s->x + rank * (dim / gpu_count), s->xb, w->layers[l].wq_o, dim, dim / gpu_count, true);
-        if(gpu_count > 1)
+            matmul(rank, s->x + rank * (dim / gpu_count), s->xb, w->layers[l].wq_o, dim, dim / gpu_count, true, 1);
             ncclAllGather(s->x + rank * (dim / gpu_count), s->x, dim / gpu_count, ncclHalf, comm, streams[rank].stream);
+        }        
+
         // ffn rmsnorm
         rmsnorm(rank, s->xb, x, w->layers[l].rms_ffn_weight, dim);
         // apply gate proj and up proj and then the silu activation in a single fused kernel
         ffn_matvec_silu(rank, s->hb + rank * (hidden_dim / gpu_count), s->xb, w->layers[l].wq_gate, w->layers[l].wq_up, dim, hidden_dim / gpu_count);
 
-        if(gpu_count > 1)
+        // final matmul (down proj) to get the output of the ffn fused with residual connection back into x
+        if(tp_mode == TP_HYBRID)
+        {
+            matmul(rank, s->x, s->hb + rank * (hidden_dim / gpu_count), w->layers[l].wq_down, hidden_dim / gpu_count, dim, true, gpu_count);
+            ncclAllReduce(s->x, s->x, dim, ncclHalf, ncclSum, comm, streams[rank].stream);
+        }
+        else
+        {
             ncclAllGather(s->hb + rank * (hidden_dim / gpu_count), s->hb, hidden_dim / gpu_count, ncclHalf, comm, streams[rank].stream);
 
-        // final matmul (down proj) to get the output of the ffn fused with residual connection back into x
-        //matmul(rank, s->x, s->hb, w->layers[l].wq_down, hidden_dim, dim, true);
-        // matmul(rank, s->xb, s->hb, w->layers[l].wq_down, hidden_dim / gpu_count, dim, false);
-        // ncclAllReduce(s->xb, s->xb, dim, ncclHalf, ncclSum, comm, streams[rank].stream);
-
-        matmul(rank, s->x + rank * (dim / gpu_count), s->hb, w->layers[l].wq_down, hidden_dim, dim / gpu_count, true);
-        if(gpu_count > 1)
+            matmul(rank, s->x + rank * (dim / gpu_count), s->hb, w->layers[l].wq_down, hidden_dim, dim / gpu_count, true, 1);
             ncclAllGather(s->x + rank * (dim / gpu_count), s->x, dim / gpu_count, ncclHalf, comm, streams[rank].stream);
-
-        //skip_connection(rank, x, s->xb, x, dim);
+        }
     }
 
     // final rmsnorm
@@ -470,7 +505,7 @@ void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPo
         ncclAllGather(s->logits + rank * (p->vocab_size / gpu_count), s->logits, p->vocab_size / gpu_count, ncclHalf, comm, streams[rank].stream);
 }
 
-void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler) {
+void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler, TP_MODE tp_mode) {
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -490,7 +525,7 @@ void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_t
     {
         cudaGraph_t graph = {};
         CUDA_CHECK(cudaStreamBeginCapture(streams[rank].stream, cudaStreamCaptureModeThreadLocal));
-        run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len_bin);
+        run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len_bin, tp_mode);
         CUDA_CHECK(cudaStreamEndCapture(streams[rank].stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&streams[rank].cudaGraphInstance[graphIndex], graph, 0));
         CUDA_CHECK(cudaGraphDestroy(graph));
@@ -498,7 +533,7 @@ void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_t
     }
     cudaGraphLaunch(streams[rank].cudaGraphInstance[graphIndex], streams[rank].stream);
 #else
-    run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len);
+    run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len, tp_mode);
 #endif
 
     if (copyLogits) {
@@ -531,19 +566,19 @@ long time_in_ms() {
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-void init_transformer(Transformer* t, bool perplexity, int rank, int gpu_count)
+void init_transformer(Transformer* t, bool perplexity, int rank, int gpu_count, TP_MODE tp_mode)
 {
     cudaSetDevice(rank);
     // read in the Transformer weights
-    malloc_weights(&(t->pInfo[rank].d_weights), &t->config, gpu_count, true);
-    if (checkpoint_init_weights(&(t->pInfo[rank].d_weights), &t->config, &t->h_weights, rank, gpu_count)) { exit(1); }
+    malloc_weights(&(t->pInfo[rank].d_weights), &t->config, gpu_count, true, tp_mode);
+    if (checkpoint_init_weights(&(t->pInfo[rank].d_weights), &t->config, &t->h_weights, rank, gpu_count, tp_mode)) { exit(1); }
 
     malloc_run_state(&(t->pInfo[rank].state), &t->config, perplexity);
 
     cudaDeviceSynchronize();
 }
 
-void build_transformer(Transformer* t, int gpu_count, char* checkpoint_path, bool perplexity) {
+void build_transformer(Transformer* t, int gpu_count, char* checkpoint_path, bool perplexity, TP_MODE tp_mode) {
     // read in the model.bin file
     FILE* file = nullptr;
     file = fopen(checkpoint_path, "rb");
@@ -559,12 +594,12 @@ void build_transformer(Transformer* t, int gpu_count, char* checkpoint_path, boo
     ncclGetUniqueId(&t->ncclId);
 
     // read in the Transformer weights
-    malloc_weights(&(t->h_weights), &t->config, 1, false);
+    malloc_weights(&(t->h_weights), &t->config, 1, false, TP_NONE);
     if (checkpoint_init_weights(&(t->h_weights), &t->config, file)) { exit(1); }
 
     std::vector<std::thread> threads;
     for (int i = 0; i < gpu_count; i++) {
-        threads.push_back(std::thread(init_transformer, t, perplexity, i, gpu_count));
+        threads.push_back(std::thread(init_transformer, t, perplexity, i, gpu_count, tp_mode));
     }
 
     for (auto& t : threads) {
@@ -597,7 +632,7 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, int* prompt_tokens, int num_prompt_tokens, int steps, int rank, int gpu_count) {
+void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, int* prompt_tokens, int num_prompt_tokens, int steps, int rank, int gpu_count, TP_MODE tp_mode) {
 
     cudaSetDevice(rank);
 
@@ -624,7 +659,7 @@ void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sa
         // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
         cudaStreamSynchronize(streams[rank].stream);
         // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
-        run_transformer(rank, gpu_count, comm, pos >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
+        run_transformer(rank, gpu_count, comm, pos >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler, tp_mode); // forward the transformer to get next token
 
         if (pos > 0) {
             next = transformer->pInfo[rank].state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
@@ -660,7 +695,7 @@ void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sa
     ncclCommDestroy(comm);
 }
 
-void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps, int gpu_count) {
+void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps, int gpu_count, TP_MODE tp_mode) {
     char empty_prompt[] = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -679,7 +714,7 @@ void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, 
 
     std::vector<std::thread> threads;
     for (int i = 0; i < gpu_count; i++) {
-        threads.push_back(std::thread(generate_thread, transformer, tokenizer, sampler, prompt_tokens, num_prompt_tokens, steps, i, gpu_count));
+        threads.push_back(std::thread(generate_thread, transformer, tokenizer, sampler, prompt_tokens, num_prompt_tokens, steps, i, gpu_count, tp_mode));
     }
 
     for (auto& t : threads) {
@@ -698,108 +733,6 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
             buffer[len - 1] = '\0'; // strip newline
         }
     }
-}
-
-// ----------------------------------------------------------------------------
-// chat loop
-void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
-    char* cli_user_prompt, char* cli_system_prompt, int steps) {
-
-    // buffers for reading the system prompt and user prompt from stdin
-    // you'll notice they are soomewhat haphazardly and unsafely set atm
-    char system_prompt[512];
-    char user_prompt[512];
-    char rendered_prompt[1152];
-    int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
-    int user_idx;
-
-    // start the main loop
-    int8_t user_turn = 1; // user starts
-    int next;        // will store the next token in the sequence
-    int token;       // stores the current token to feed into the transformer
-    int pos = 0;     // position in the sequence
-
-    int rank = 0;
-    int gpu_count = 1;
-    ncclComm_t comm;
-
-    // init GPU state
-    cudaMemset(transformer->pInfo[rank].state.pos, pos, sizeof(int));
-    transformer->pInfo[rank].state.shared_data->pos = pos;
-
-    while (pos < steps) {
-
-        // when it is the user's turn to contribute tokens to the dialog...
-        if (user_turn) {
-            // get the (optional) system prompt at position 0
-            if (pos == 0) {
-                // at position 0, the user can also contribute a system prompt
-                if (cli_system_prompt == NULL) {
-                    // system prompt was not passed in, attempt to get it from stdin
-                    read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
-                }
-                else {
-                    // system prompt was passed in, use it
-                    strcpy(system_prompt, cli_system_prompt);
-                }
-            }
-            // get the user prompt
-            if (pos == 0 && cli_user_prompt != NULL) {
-                // user prompt for position 0 was passed in, use it
-                strcpy(user_prompt, cli_user_prompt);
-            }
-            else {
-                // otherwise get user prompt from stdin
-                read_stdin("User: ", user_prompt, sizeof(user_prompt));
-            }
-            // render user/system prompts into the Llama 2 Chat schema
-            if (pos == 0 && system_prompt[0] != '\0') {
-                char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
-                sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
-            }
-            else {
-                char user_template[] = "[INST] %s [/INST]";
-                sprintf(rendered_prompt, user_template, user_prompt);
-            }
-
-            printf("\nRendered prompt: %s\n", rendered_prompt); // Ankan - test!
-
-            // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-            user_idx = 0; // reset the user index
-            user_turn = 0;
-            printf("Assistant: ");
-
-            // copy encoded tokens to GPU
-            memcpy(&transformer->pInfo[rank].state.shared_data->tokens[pos], prompt_tokens, sizeof(int) * num_prompt_tokens);
-        }
-
-        // wait for GPU work for previous iteration to complete
-        // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
-        cudaStreamSynchronize(streams[rank].stream);
-        run_transformer(rank, gpu_count, comm, user_idx >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler); // forward the transformer to get next token
-
-        user_idx++;
-
-        if (user_idx > 0) {
-            next = transformer->pInfo[rank].state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
-            if (next == eos_token) { 
-                user_turn = 1;  // EOS token ends the Assistant turn
-                printf("\n");
-            } 
-            else if (user_idx > num_prompt_tokens) {
-                char* piece = decode(tokenizer, token, next);
-                safe_printf(piece);
-            }
-
-            // advance forward
-            token = next;
-        }
-        pos++;
-    }
-    printf("\n");
-    free(prompt_tokens);
 }
 
 // ----------------------------------------------------------------------------
@@ -858,8 +791,7 @@ int main(int argc, char *argv[]) {
     float temperature = 0.5f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.6f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char default_mode[] = "generate";
-    char* mode = default_mode;  // generate|chat
+    TP_MODE tp_mode = TP_NONE;
     char* system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse
@@ -878,8 +810,14 @@ int main(int argc, char *argv[]) {
             case 't': temperature = atof(argv[i + 1]); break;
             case 'p': topp = atof(argv[i + 1]); break;
             case 's': rng_seed = atoi(argv[i + 1]); break;
-            case 'm': mode = argv[i + 1]; break;
             case 'y': system_prompt = argv[i + 1]; break;
+            case 'x': {
+                if (strcmp(argv[i + 1], "none") == 0) tp_mode = TP_NONE;
+                else if (strcmp(argv[i + 1], "column") == 0) tp_mode = TP_COLUMN;
+                else if (strcmp(argv[i + 1], "hybrid") == 0) tp_mode = TP_HYBRID;
+                else { printf("Unknown tp_mode: %s\n", argv[i + 1]); exit(1); }
+                break;
+            }
             case 'q': {
                 dataset_path = argv[i + 1];
                 break;
@@ -901,7 +839,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (strcmp(mode, "perplexity") == 0) perplexity = true;
+    // no multi-gpu
+    if(tp_mode == TP_NONE)
+        gpu_count = 1;
 
     // parameter validation/overrides
     if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
@@ -912,7 +852,7 @@ int main(int argc, char *argv[]) {
 
     // build the Transformer via the model .bin file
     Transformer transformer;
-    build_transformer(&transformer, gpu_count, checkpoint_path, perplexity);
+    build_transformer(&transformer, gpu_count, checkpoint_path, perplexity, tp_mode);
     if (steps <= 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
 
     // create and init the tokenizer
@@ -925,14 +865,7 @@ int main(int argc, char *argv[]) {
 
     streams = new PerGPUExecutionData[gpu_count];
 
-    if (perplexity)
-        parseDataSetAndComputePreplexity(dataset_path, &tokenizer, &transformer.config, &transformer.pInfo[0].state, &transformer.pInfo[0].d_weights, &sampler);
-    else if (strcmp(mode, "generate") == 0)
-        generate(&transformer, &tokenizer, &sampler, prompt, steps, gpu_count);
-    else if (strcmp(mode, "chat") == 0)
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
-    else
-        error_usage(argv);
+    generate(&transformer, &tokenizer, &sampler, prompt, steps, gpu_count, tp_mode);
 
     // memory cleanup
     free_transformer(&transformer);

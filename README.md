@@ -110,6 +110,17 @@ Architecture
 achieved tok/s: 200.787402. Tokens: 255, seconds: 1.27
 ```
 
+## Multi-GPU support
+
+The application shows column-wise and hybrid split strategy
+* column-wise split strategy adds total 4 AllGather in each decoder layer - before, after O-proj and before, after FFN-down
+* hybrid split strategy adds total 2 AllReduce in each decoder layer - after O-proj and after FFN-down
+
+The strategy can be controlled with `-x` command line option.
+- ``x "none"`: Run on single GPU
+- `-x "column"` : Column wise split strategy
+- `-x "hybrid"` : Hyrid split strategy
+
 ## License
 
 MIT
