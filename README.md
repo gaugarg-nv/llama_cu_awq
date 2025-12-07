@@ -141,8 +141,8 @@ achieved tok/s: 200.787402. Tokens: 255, seconds: 1.27
 ## Multi-GPU support
 
 The application shows column-wise and hybrid split strategy
-* column-wise split strategy adds total 4 AllGather in each decoder layer - before, after O-proj and before, after FFN-down. This strategy split all linear layers along column (K-dimension).
-* hybrid split strategy adds total 2 AllReduce in each decoder layer - after O-proj and after FFN-down. This strategy splits qkv/ffn-up-gate along column and O-proj/ffn-down along row (along N dimension).
+* column-wise split strategy adds total 4 AllGather in each decoder layer - before, after O-proj and before, after FFN-down. This strategy split all linear layers along column (N-dimension).
+* hybrid split strategy adds total 2 AllReduce in each decoder layer - after O-proj and after FFN-down. This strategy splits qkv/ffn-up-gate along column and O-proj/ffn-down along row (along K-dimension).
 
 The strategy can be controlled with `-x` command line option.
 - `-x "none"`: Run on single GPU
