@@ -6,6 +6,8 @@ Based on [llama2.c](https://github.com/karpathy/llama2.c)
 
 ## Build
 
+Make sure `nvcc` is in the `PATH`. Download and extract Nvidia HPC SDK for NCCL: https://developer.nvidia.com/hpc-sdk-downloads
+
 ```
 git clone https://github.com/ankan-ban/llama_cu_awq
 cd llama_cu_awq
