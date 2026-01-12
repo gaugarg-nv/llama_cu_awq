@@ -220,7 +220,7 @@ __forceinline__ __device__ float get_mat_vec_int4(int index, const half* __restr
 
 __device__ void mat_vec_int4(half* __restrict__ output, const half* __restrict__ input,
     const uint32_t* __restrict__ q_weight, const uint32_t* __restrict__ q_zeros, const half* __restrict__ scales,
-    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, int loff, int* pPos)
+    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, int gpu_count, int loff, int* pPos)
 {
     int index = blockIdx.x * blockDim.y + threadIdx.y;
     if (index >= opElements)
@@ -235,16 +235,16 @@ __device__ void mat_vec_int4(half* __restrict__ output, const half* __restrict__
         }
 
         if (accum)
-            sum += (float)output[index];
+            sum += (float)output[index] / gpu_count;
         output[index] = (half)sum;
     }
 }
 
 __global__ void mat_vec_kernel_int4(half* __restrict__ output, const half* __restrict__ input,
     const uint32_t* __restrict__ q_weight, const uint32_t* __restrict__ q_zeros, const half* __restrict__ scales,
-    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, int loff, int* pPos)
+    int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, bool accum, int gpu_count, int loff, int* pPos)
 {
-    mat_vec_int4(output, input, q_weight, q_zeros, scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, accum, loff, pPos);
+    mat_vec_int4(output, input, q_weight, q_zeros, scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, accum, gpu_count, loff, pPos);
 }
 
 __global__ void qkv_matvec_kernel(half* __restrict__ q, half* __restrict__ key_cache, half* __restrict__ value_cache, const half* __restrict__ input,
@@ -254,11 +254,11 @@ __global__ void qkv_matvec_kernel(half* __restrict__ q, half* __restrict__ key_c
     int inputElements, int opElements, int packed_zeros_height, int scales_height, int packed_weights_height, int loff, int* pPos)
 {
     if (blockIdx.y == 0)
-        mat_vec_int4(q, input, q_weight, q_zeros, q_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, -1, nullptr);
+        mat_vec_int4(q, input, q_weight, q_zeros, q_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, 1, -1, nullptr);
     else if (blockIdx.y == 1)
-        mat_vec_int4(key_cache, input, k_weight, k_zeros, k_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, loff, pPos);
+        mat_vec_int4(key_cache, input, k_weight, k_zeros, k_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, 1, loff, pPos);
     else // if (blockIdx.y == 2)
-        mat_vec_int4(value_cache, input, v_weight, v_zeros, v_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, loff, pPos);
+        mat_vec_int4(value_cache, input, v_weight, v_zeros, v_scales, inputElements, opElements, packed_zeros_height, scales_height, packed_weights_height, false, 1, loff, pPos);
 }
 
 __global__ void  ffn_matvec_silu_kernel(half* __restrict__ output, const half* __restrict__ input, 
