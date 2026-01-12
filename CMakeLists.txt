@@ -10,26 +10,34 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 80 120)
 endif()
 
-# Find NCCL
-find_path(NCCL_INCLUDE_DIR nccl.h 
-    PATHS ${NCCL_ROOT_DIR}/include)
+# Option to enable NCCL
+option(ENABLE_NCCL "Enable NCCL for multi-GPU communication" OFF)
 
-find_library(NCCL_LIBRARY NAMES nccl
-    PATHS ${NCCL_ROOT_DIR}/lib)
+if(ENABLE_NCCL)
+    # Find NCCL
+    find_path(NCCL_INCLUDE_DIR nccl.h 
+        PATHS ${NCCL_ROOT_DIR}/include)
 
-if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
-    message(STATUS "Found NCCL: ${NCCL_LIBRARY}")
+    find_library(NCCL_LIBRARY NAMES nccl
+        PATHS ${NCCL_ROOT_DIR}/lib)
+
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+        message(STATUS "Found NCCL: ${NCCL_LIBRARY}")
+        message(STATUS "Using NCCL for multi-GPU communication")
+    else()
+        message(FATAL_ERROR "NCCL not found. Set NCCL_ROOT_DIR or disable ENABLE_NCCL.")
+    endif()
 else()
-    message(WARNING "NCCL not found. Multi-GPU support will not be available.")
+    message(STATUS "Using native CUDA implementation for multi-GPU communication")
 endif()
 
 # Executables
 add_executable(weight_packer weight_packer.cpp)
 add_executable(llama2_q4 llama2_q4.cu)
 
-# Link NCCL
-if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+# Configure NCCL if enabled
+if(ENABLE_NCCL)
     target_include_directories(llama2_q4 PRIVATE ${NCCL_INCLUDE_DIR})
     target_link_libraries(llama2_q4 PRIVATE ${NCCL_LIBRARY})
-    target_compile_definitions(llama2_q4 PRIVATE NCCL_ENABLED)
+    target_compile_definitions(llama2_q4 PRIVATE ENABLE_NCCL)
 endif()

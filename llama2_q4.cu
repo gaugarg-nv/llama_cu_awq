@@ -30,7 +30,7 @@ Inference for Llama-2 Transformer model in pure Cuda.
 
 constexpr int group_size = 128; // hardcoded for this implementation
 #define DUMP_PER_TOKEN_TIMINGS 0
-#define USE_CUDA_GRAPHS 1
+#define USE_CUDA_GRAPHS 0
 
 #define CUDA_CHECK(call) \
 do { \
@@ -426,7 +426,11 @@ void MultiHeadAttention(int rank, half *output, half *q, half *key_cache, half *
     vec_mat_kernel <<< grid_dim2, block_dim, 0, streams[rank].stream >>> (output, att, value_cache, head_size, pPos, head_size, head_size, dim / kv_mul, kv_mul);
 }
 
+#ifdef ENABLE_NCCL
 void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin, TP_MODE tp_mode) {
+#else
+void run_llama_network(int rank, int gpu_count, CudaComm* comm, int *pPos, Config* p, RunState* s, TransformerWeights* w, int seq_len_bin, TP_MODE tp_mode) {
+#endif
     half* x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -466,14 +470,26 @@ void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPo
         if(tp_mode == TP_HYBRID)
         {
             matmul(rank, s->x, s->xb + rank * (dim / gpu_count), w->layers[l].wq_o, dim / gpu_count, dim, true, gpu_count);
+#ifdef ENABLE_NCCL
             ncclAllReduce(s->x, s->x, dim, ncclHalf, ncclSum, comm, streams[rank].stream);
+#else
+            cudaAllReduce(s->x, s->x, dim, CUDA_HALF, CUDA_SUM, comm, streams[rank].stream);
+#endif
         }
         else
         {
+#ifdef ENABLE_NCCL
             ncclAllGather(s->xb + rank * (dim / gpu_count), s->xb, dim / gpu_count, ncclHalf, comm, streams[rank].stream);
+#else
+            cudaAllGather(s->xb + rank * (dim / gpu_count), s->xb, dim / gpu_count, CUDA_HALF, comm, streams[rank].stream);
+#endif
 
             matmul(rank, s->x + rank * (dim / gpu_count), s->xb, w->layers[l].wq_o, dim, dim / gpu_count, true, 1);
+#ifdef ENABLE_NCCL
             ncclAllGather(s->x + rank * (dim / gpu_count), s->x, dim / gpu_count, ncclHalf, comm, streams[rank].stream);
+#else
+            cudaAllGather(s->x + rank * (dim / gpu_count), s->x, dim / gpu_count, CUDA_HALF, comm, streams[rank].stream);
+#endif
         }        
 
         // ffn rmsnorm
@@ -485,14 +501,26 @@ void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPo
         if(tp_mode == TP_HYBRID)
         {
             matmul(rank, s->x, s->hb + rank * (hidden_dim / gpu_count), w->layers[l].wq_down, hidden_dim / gpu_count, dim, true, gpu_count);
+#ifdef ENABLE_NCCL
             ncclAllReduce(s->x, s->x, dim, ncclHalf, ncclSum, comm, streams[rank].stream);
+#else
+            cudaAllReduce(s->x, s->x, dim, CUDA_HALF, CUDA_SUM, comm, streams[rank].stream);
+#endif
         }
         else
         {
+#ifdef ENABLE_NCCL
             ncclAllGather(s->hb + rank * (hidden_dim / gpu_count), s->hb, hidden_dim / gpu_count, ncclHalf, comm, streams[rank].stream);
+#else
+            cudaAllGather(s->hb + rank * (hidden_dim / gpu_count), s->hb, hidden_dim / gpu_count, CUDA_HALF, comm, streams[rank].stream);
+#endif
 
             matmul(rank, s->x + rank * (dim / gpu_count), s->hb, w->layers[l].wq_down, hidden_dim, dim / gpu_count, true, 1);
+#ifdef ENABLE_NCCL
             ncclAllGather(s->x + rank * (dim / gpu_count), s->x, dim / gpu_count, ncclHalf, comm, streams[rank].stream);
+#else
+            cudaAllGather(s->x + rank * (dim / gpu_count), s->x, dim / gpu_count, CUDA_HALF, comm, streams[rank].stream);
+#endif
         }
     }
 
@@ -502,10 +530,18 @@ void run_llama_network(int rank, int gpu_count, const ncclComm_t& comm, int *pPo
     matmul(rank, s->logits + rank * (p->vocab_size / gpu_count), x, w->wcls, p->dim, p->vocab_size / gpu_count);
 
     if(gpu_count > 1)
+#ifdef ENABLE_NCCL
         ncclAllGather(s->logits + rank * (p->vocab_size / gpu_count), s->logits, p->vocab_size / gpu_count, ncclHalf, comm, streams[rank].stream);
+#else
+        cudaAllGather(s->logits + rank * (p->vocab_size / gpu_count), s->logits, p->vocab_size / gpu_count, CUDA_HALF, comm, streams[rank].stream);
+#endif
 }
 
+#ifdef ENABLE_NCCL
 void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler, TP_MODE tp_mode) {
+#else
+void run_transformer(int rank, int gpu_count, CudaComm* comm, bool gen_token, Config* p, RunState* s, TransformerWeights* w, bool copyLogits, Sampler *pSampler, TP_MODE tp_mode) {
+#endif
 #if DUMP_PER_TOKEN_TIMINGS == 1
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -525,7 +561,11 @@ void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_t
     {
         cudaGraph_t graph = {};
         CUDA_CHECK(cudaStreamBeginCapture(streams[rank].stream, cudaStreamCaptureModeThreadLocal));
+#ifdef ENABLE_NCCL
         run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len_bin, tp_mode);
+#else
+        run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len_bin, tp_mode);
+#endif
         CUDA_CHECK(cudaStreamEndCapture(streams[rank].stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&streams[rank].cudaGraphInstance[graphIndex], graph, 0));
         CUDA_CHECK(cudaGraphDestroy(graph));
@@ -533,7 +573,11 @@ void run_transformer(int rank, int gpu_count, const ncclComm_t& comm, bool gen_t
     }
     cudaGraphLaunch(streams[rank].cudaGraphInstance[graphIndex], streams[rank].stream);
 #else
+#ifdef ENABLE_NCCL
     run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len, tp_mode);
+#else
+    run_llama_network(rank, gpu_count, comm, s->pos, p, s, w, seq_len, tp_mode);
+#endif
 #endif
 
     if (copyLogits) {
@@ -591,7 +635,11 @@ void build_transformer(Transformer* t, int gpu_count, char* checkpoint_path, boo
 
     t->gpu_count = gpu_count;
     t->pInfo = new PerThreadInfo[gpu_count];
+#ifdef ENABLE_NCCL
     ncclGetUniqueId(&t->ncclId);
+#else
+    cudaCommGetUniqueId(&t->commId);
+#endif
 
     // read in the Transformer weights
     malloc_weights(&(t->h_weights), &t->config, 1, false, TP_NONE);
@@ -636,8 +684,13 @@ void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sa
 
     cudaSetDevice(rank);
 
+#ifdef ENABLE_NCCL
     ncclComm_t comm;
     ncclCommInitRank(&comm, gpu_count, transformer->ncclId, rank);
+#else
+    CudaComm comm;
+    cudaCommInitRank(&comm, gpu_count, &transformer->commId, rank);
+#endif
 
     cudaStreamCreate(&streams[rank].stream);
 
@@ -659,7 +712,11 @@ void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sa
         // the idea is to keep GPU working in parallel with any CPU work (e.g, printing tokens to console).
         cudaStreamSynchronize(streams[rank].stream);
         // Perf note: don't put CPU work here "before" calling transformer as it won't overlap with GPU execution.
+#ifdef ENABLE_NCCL
         run_transformer(rank, gpu_count, comm, pos >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler, tp_mode); // forward the transformer to get next token
+#else
+        run_transformer(rank, gpu_count, &comm, pos >= num_prompt_tokens - 1, &transformer->config, &transformer->pInfo[rank].state, &transformer->pInfo[rank].d_weights, false, sampler, tp_mode); // forward the transformer to get next token
+#endif
 
         if (pos > 0) {
             next = transformer->pInfo[rank].state.shared_data->tokens[pos];  // Note: this is output token from previous iteration
@@ -692,7 +749,11 @@ void generate_thread(Transformer* transformer, Tokenizer* tokenizer, Sampler* sa
         if (streams[rank].graphCaptured[i]) cudaGraphExecDestroy(streams[rank].cudaGraphInstance[i]);
 #endif
 
+#ifdef ENABLE_NCCL
     ncclCommDestroy(comm);
+#else
+    cudaCommDestroy(&comm);
+#endif
 }
 
 void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler, char* prompt, int steps, int gpu_count, TP_MODE tp_mode) {

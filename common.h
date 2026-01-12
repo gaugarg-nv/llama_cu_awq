@@ -3,7 +3,11 @@
 #include <stdint.h>
 #include <cuda_fp16.h>
 
+#ifdef ENABLE_NCCL
 #include "nccl.h"
+#else
+#include "cuda_comm.h"
+#endif
 
 constexpr int MAX_SEQ_LEN_SMEM_KERNEL = 8192; // 8k is the max sequence length supported by the kernel that uses shared memory
 constexpr int MAX_SEQ_LEN = 128 * 1024;       // Can be arbitirarily large, but we need to allocate memory for the whole sequence
@@ -74,7 +78,11 @@ typedef struct {
 } RunState;
 
 struct PerThreadInfo {
+#ifdef ENABLE_NCCL
     ncclComm_t comm;
+#else
+    CudaComm comm;
+#endif
     int rank;
     TransformerWeights d_weights; // the weights of the model on device
     RunState state; // buffers for the "wave" of activations in the forward pass
@@ -83,8 +91,12 @@ struct PerThreadInfo {
 typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights h_weights; // the weights of the model on host
-    PerThreadInfo* pInfo; // NCCL info for multi-GPU communication
+    PerThreadInfo* pInfo; // Multi-GPU communication info
+#ifdef ENABLE_NCCL
     ncclUniqueId ncclId; // NCCL unique ID
+#else
+    CudaCommId commId; // Communication unique ID
+#endif
     int gpu_count; // number of GPUs being used
 } Transformer;
 
