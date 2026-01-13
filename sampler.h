@@ -7,7 +7,7 @@ struct PerGPUMemory
     void* tempStorage_sort = nullptr;
 };
 
-typedef struct {
+struct Sampler{
     int vocab_size = 0;
     size_t temp_storage_bytes_scan = 0;
     size_t temp_storage_bytes_sort = 0;
@@ -16,7 +16,7 @@ typedef struct {
     unsigned long long rng_state = 0;
     PerGPUMemory* pMem = nullptr;
     int gpu_count = 0;
-} Sampler;
+};
 
 void init_sampler(Sampler* sampler, int gpu_id) {
     cudaSetDevice(gpu_id);

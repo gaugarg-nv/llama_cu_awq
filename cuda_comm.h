@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <iostream>
+#include <barrier>
 
 // Native CUDA multi-GPU communication implementation
 // Replaces NCCL functionality with peer-to-peer memory access and synchronization
@@ -17,28 +18,18 @@ constexpr int MAX_GPUS = 8;
 // Simple C++ barrier implementation (C++20 std::barrier alternative)
 class CudaBarrier {
 private:
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::atomic<int> count_;
-    std::atomic<int> generation_;
-    int thread_count_;
-
+    std::barrier<>* barrier_;
 public:
-    explicit CudaBarrier(int count) : count_(count), generation_(0), thread_count_(count) {}
+    explicit CudaBarrier(int count) {
+            barrier_ = new std::barrier<>(count);
+    }
+
+    ~CudaBarrier() {
+        delete barrier_;
+    }
     
     void wait() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        int gen = generation_.load();
-        
-        if (--count_ == 0) {
-            // Last thread to arrive
-            generation_++;
-            count_ = thread_count_;
-            cv_.notify_all();
-        } else {
-            // Wait for the last thread
-            cv_.wait(lock, [this, gen] { return gen != generation_.load(); });
-        }
+        barrier_->arrive_and_wait();
     }
 };
 
@@ -120,6 +111,7 @@ inline void cudaCommInitRank(CudaComm* comm, int gpu_count, CudaCommId* id, int 
     // Enable peer access to all other GPUs
     for (int i = 0; i < gpu_count; i++) {
         comm->p2p_access[i] = false;
+#if 1
         if (i != rank) {
             int can_access = 0;
             cudaDeviceCanAccessPeer(&can_access, rank, i);
@@ -144,6 +136,7 @@ inline void cudaCommInitRank(CudaComm* comm, int gpu_count, CudaCommId* id, int 
                 std::cout << "GPU " << rank << " cannot access GPU " << i << std::endl;
             }
         }
+#endif
     }
 }
 

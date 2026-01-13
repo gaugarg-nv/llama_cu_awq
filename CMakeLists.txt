@@ -2,12 +2,12 @@ cmake_minimum_required(VERSION 3.18)
 project(llama2_q4 LANGUAGES CXX CUDA)
 
 # Set standards
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set CUDA architectures
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80 120)
+    set(CMAKE_CUDA_ARCHITECTURES 80 89 120)
 endif()
 
 # Option to enable NCCL
